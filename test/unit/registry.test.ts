@@ -99,6 +99,24 @@ describe('Registry utilities', () => {
       expect(firstRoute!.tokens.length).to.be.greaterThan(0);
       const noRoutes = await registry.getWarpRoutes({ symbol: 'NOTFOUND' });
       expect(Object.keys(noRoutes).length).to.eql(0);
+    }).timeout(15_000);
+
+    it(`Fetches warp deploy configs for ${registry.type} registry`, async () => {
+      const routes = await registry.getWarpDeployConfigs();
+      const routeIds = Object.keys(routes);
+
+      // TODO: Right now this returns an empty array
+      // This cannot be implemented without deriving the token symbol from config.token
+      // We will revisit once we merge the configs
+      if (registry.type === RegistryType.Partial) expect(routeIds.length).to.be.equal(0);
+      else {
+        expect(routeIds.length).to.be.greaterThan(0);
+        const firstRoute = await registry.getWarpDeployConfig(routeIds[0]);
+        const chains = Object.keys(firstRoute!);
+        expect(chains.length).to.be.greaterThan(0);
+        const noRoutes = await registry.getWarpDeployConfigs({ chainName: 'NOTFOUND' });
+        expect(Object.keys(noRoutes).length).to.eql(0);
+      }
     }).timeout(10_000);
 
     // TODO remove this once GitHubRegistry methods are implemented
@@ -133,11 +151,8 @@ describe('Registry utilities', () => {
       });
       const outputBasePath = `deployments/warp_routes/${MOCK_SYMBOL}/${MOCK_CHAIN_NAME}-${MOCK_CHAIN_NAME2}-`;
       const configPath = `${outputBasePath}config.yaml`;
-      const addressesPath = `${outputBasePath}addresses.yaml`;
       expect(fs.existsSync(configPath)).to.be.true;
-      expect(fs.existsSync(addressesPath)).to.be.true;
       fs.unlinkSync(configPath);
-      fs.unlinkSync(addressesPath);
       fs.rmdirSync(`deployments/warp_routes/${MOCK_SYMBOL}`);
     }).timeout(5_000);
 
@@ -155,11 +170,8 @@ describe('Registry utilities', () => {
       );
       const outputBasePath = `deployments/warp_routes/${MOCKED_OPTION_SYMBOL}/${MOCK_CHAIN_NAME}-${MOCK_CHAIN_NAME2}-`;
       const configPath = `${outputBasePath}config.yaml`;
-      const addressesPath = `${outputBasePath}addresses.yaml`;
       expect(fs.existsSync(configPath)).to.be.true;
-      expect(fs.existsSync(addressesPath)).to.be.true;
       fs.unlinkSync(configPath);
-      fs.unlinkSync(addressesPath);
       fs.rmdirSync(`deployments/warp_routes/${MOCKED_OPTION_SYMBOL}`);
     }).timeout(5_000);
   }
@@ -215,15 +227,9 @@ describe('Registry utilities', () => {
 
   describe('Authenticated GithubRegistry', () => {
     const proxyUrl = 'http://proxy.hyperlane.xyz';
-    let authenticatedGithubRegistry;
-    let invalidTokenGithubRegistry;
-    let getApiRateLimitStub;
-    before(function () {
-      if (!process.env.GITHUB_TOKEN) {
-        console.log('Skipping tests because GITHUB_TOKEN is not defined');
-        this.skip();
-      }
-    });
+    let authenticatedGithubRegistry: GithubRegistry;
+    let invalidTokenGithubRegistry: GithubRegistry;
+    let getApiRateLimitStub: sinon.SinonStub;
     beforeEach(() => {
       authenticatedGithubRegistry = new GithubRegistry({
         branch: GITHUB_REGISTRY_BRANCH,
@@ -235,31 +241,39 @@ describe('Registry utilities', () => {
         proxyUrl,
         authToken: 'invalid_token',
       });
-      getApiRateLimitStub = sinon.stub(authenticatedGithubRegistry, 'getApiRateLimit');
     });
     afterEach(() => {
       sinon.restore();
     });
-    it('always uses the authenticated api if rate limit has been not been hit', async () => {
-      getApiRateLimitStub.returns({ remaining: 10 });
-      expect(await authenticatedGithubRegistry.getApiUrl()).to.equal(
-        `${GITHUB_API_URL}/repos/hyperlane-xyz/hyperlane-registry/git/trees/main?recursive=true`,
-      );
-    });
-
-    it('should fallback to proxy url if public rate limit has been hit', async () => {
-      getApiRateLimitStub.returns({ remaining: 0 });
-      expect(await authenticatedGithubRegistry.getApiUrl()).to.equal(
-        `${proxyUrl}/repos/hyperlane-xyz/hyperlane-registry/git/trees/main?recursive=true`,
-      );
-    });
-
-    it('should fetch chains with authenticated token', async () => {
-      expect(invalidTokenGithubRegistry.getChains()).to.eventually.be.fulfilled;
+    it('should fetch chains with authenticated token', async function () {
+      if (!process.env.GITHUB_TOKEN) {
+        console.log('Skipping this test because GITHUB_TOKEN is not defined');
+        this.skip();
+      }
+      return expect(authenticatedGithubRegistry.getChains()).to.eventually.be.fulfilled;
     });
 
     it('should fail fetching chains with invalid authentication token', async () => {
-      expect(invalidTokenGithubRegistry.getChains()).to.eventually.be.rejected;
+      return expect(invalidTokenGithubRegistry.getChains()).to.eventually.be.rejected;
+    });
+
+    describe('GitHub API rate limit handling and fallback behavior:', () => {
+      beforeEach(() => {
+        getApiRateLimitStub = sinon.stub(authenticatedGithubRegistry, 'getApiRateLimit');
+      });
+      it('always uses the authenticated api if rate limit has been not been hit', async () => {
+        getApiRateLimitStub.resolves({ limit: 100, used: 90, remaining: 10, reset: 1234567890 });
+        expect(await authenticatedGithubRegistry.getApiUrl()).to.equal(
+          `${GITHUB_API_URL}/repos/hyperlane-xyz/hyperlane-registry/git/trees/main?recursive=true`,
+        );
+      });
+
+      it('should fallback to proxy url if public rate limit has been hit', async () => {
+        getApiRateLimitStub.resolves({ limit: 100, used: 100, remaining: 0, reset: 1234567890 });
+        expect(await authenticatedGithubRegistry.getApiUrl()).to.equal(
+          `${proxyUrl}/repos/hyperlane-xyz/hyperlane-registry/git/trees/main?recursive=true`,
+        );
+      });
     });
   });
 });
@@ -271,5 +285,35 @@ describe('Registry regex', () => {
     expect(CHAIN_FILE_REGEX.test('chains/_NotAChain/addresses.yaml')).to.be.false;
     expect(CHAIN_FILE_REGEX.test('chains/foobar/logo.svg')).to.be.true;
     expect(CHAIN_FILE_REGEX.test('chains/foobar/randomfile.txt')).to.be.false;
+  });
+});
+
+describe('Warp routes file structure', () => {
+  const localRegistry = new FileSystemRegistry({ uri: './' });
+  const WARP_ROUTES_PATH = 'deployments/warp_routes';
+
+  const findAddressesYaml = (dir: string): string | null => {
+    try {
+      const files = fs.readdirSync(dir);
+      for (const file of files) {
+        const path = `${dir}/${file}`;
+        if (file === 'addresses.yaml') return path;
+        if (fs.statSync(path).isDirectory()) {
+          const result = findAddressesYaml(path);
+          if (result) return result;
+        }
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  it('should not contain addresses.yaml files', async () => {
+    const warpRoutes = await localRegistry.getWarpRoutes();
+    expect(Object.keys(warpRoutes).length).to.be.greaterThan(0);
+
+    const foundPath = findAddressesYaml(WARP_ROUTES_PATH);
+    expect(foundPath, foundPath ? `Found addresses.yaml at: ${foundPath}` : '').to.be.null;
   });
 });
